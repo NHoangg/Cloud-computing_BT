@@ -5,8 +5,9 @@ const { randomUUID } = require('node:crypto');
 const { JsonStore } = require('./data/store');
 const { sendReceiptEmail } = require('./email/receiptMailer');
 const { formatCurrency, formatDate, renderReceiptHtml, escapeHtml } = require('./receipt');
+const { uploadProductImage } = require('./storage/s3ImageStorage');
 
-function createApp({ store = new JsonStore(), mailer = sendReceiptEmail } = {}) {
+function createApp({ store = new JsonStore(), mailer = sendReceiptEmail, imageUploader = uploadProductImage } = {}) {
   const sessions = new Map();
 
   return async function app(req, res) {
@@ -20,6 +21,13 @@ function createApp({ store = new JsonStore(), mailer = sendReceiptEmail } = {}) 
         return send(res, 200, fs.readFileSync(path.join(process.cwd(), 'public', 'styles.css')), 'text/css; charset=utf-8');
       }
 
+      if (req.method === 'GET' && requestUrl.pathname.startsWith('/uploads/')) {
+        const uploadPath = path.join(process.cwd(), 'public', requestUrl.pathname);
+        if (!uploadPath.startsWith(path.join(process.cwd(), 'public', 'uploads'))) return send(res, 403, 'Forbidden');
+        if (!fs.existsSync(uploadPath)) return send(res, 404, 'Image not found');
+        return send(res, 200, fs.readFileSync(uploadPath), imageContentType(uploadPath));
+      }
+
       if (req.method === 'GET' && requestUrl.pathname === '/') {
         if (currentTenant && currentUser) return redirect(res, '/dashboard');
         return html(res, 'Login or Register', authPage(store));
@@ -30,8 +38,8 @@ function createApp({ store = new JsonStore(), mailer = sendReceiptEmail } = {}) 
       }
 
       if (req.method === 'POST' && requestUrl.pathname === '/login') {
-        const body = await parseForm(req);
-        const user = store.authenticate(body.get('email'), body.get('password'));
+        const body = await parseBody(req);
+        const user = store.authenticate(body.fields.get('email'), body.fields.get('password'));
         if (!user) {
           return html(res, 'Login failed', `${authPage(store)}<p class="notice error">Invalid email or password.</p>`, 401);
         }
@@ -45,12 +53,12 @@ function createApp({ store = new JsonStore(), mailer = sendReceiptEmail } = {}) 
       }
 
       if (req.method === 'POST' && requestUrl.pathname === '/register') {
-        const body = await parseForm(req);
+        const body = await parseBody(req);
         const { tenant, user } = store.registerTenantWithUser({
-          tenantName: body.get('tenantName'),
-          name: body.get('name'),
-          email: body.get('email'),
-          password: body.get('password')
+          tenantName: body.fields.get('tenantName'),
+          name: body.fields.get('name'),
+          email: body.fields.get('email'),
+          password: body.fields.get('password')
         });
         session.userId = user.id;
         session.tenantId = tenant.id;
@@ -85,11 +93,13 @@ function createApp({ store = new JsonStore(), mailer = sendReceiptEmail } = {}) 
         return html(res, 'Products', `
           ${tenantHeader(tenant, user)}
           <section class="grid two">
-            <form class="card" method="post" action="/products">
+            <form class="card" method="post" action="/products" enctype="multipart/form-data">
               <h2>Add Product</h2>
               <label>Name <input required name="name" placeholder="Product name"></label>
               <label>Price <input required name="price" type="number" min="0.01" step="0.01" placeholder="0.00"></label>
               <label>Description <textarea name="description" placeholder="Optional category or description"></textarea></label>
+              <label>Product image <input name="image" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></label>
+              <p class="help">Images are uploaded to AWS S3 when AWS variables are configured; otherwise they are stored locally for development.</p>
               <button type="submit">Save product</button>
             </form>
             <section class="card"><h2>Tenant Products</h2>${productManagementTable(store.listProducts(tenant.id))}</section>
@@ -97,22 +107,27 @@ function createApp({ store = new JsonStore(), mailer = sendReceiptEmail } = {}) 
       }
 
       if (req.method === 'POST' && requestUrl.pathname === '/products') {
-        const body = await parseForm(req);
+        const body = await parseBody(req);
+        const imageUrl = await uploadImageFromBody(body, imageUploader);
         store.createProduct(tenant.id, {
-          name: body.get('name'),
-          price: body.get('price'),
-          description: body.get('description')
+          name: body.fields.get('name'),
+          price: body.fields.get('price'),
+          description: body.fields.get('description'),
+          imageUrl
         });
         return redirect(res, '/products');
       }
 
       const productUpdateMatch = requestUrl.pathname.match(/^\/products\/([^/]+)\/update$/);
       if (req.method === 'POST' && productUpdateMatch) {
-        const body = await parseForm(req);
+        const body = await parseBody(req);
+        const currentProduct = store.getProduct(tenant.id, productUpdateMatch[1]);
+        const imageUrl = (await uploadImageFromBody(body, imageUploader)) || currentProduct?.imageUrl || '';
         store.updateProduct(tenant.id, productUpdateMatch[1], {
-          name: body.get('name'),
-          price: body.get('price'),
-          description: body.get('description')
+          name: body.fields.get('name'),
+          price: body.fields.get('price'),
+          description: body.fields.get('description'),
+          imageUrl
         });
         return redirect(res, '/products');
       }
@@ -143,12 +158,12 @@ function createApp({ store = new JsonStore(), mailer = sendReceiptEmail } = {}) 
       }
 
       if (req.method === 'POST' && requestUrl.pathname === '/transactions') {
-        const body = await parseForm(req);
-        const productIds = body.getAll('productId');
-        const quantities = body.getAll('quantity');
+        const body = await parseBody(req);
+        const productIds = body.fields.getAll('productId');
+        const quantities = body.fields.getAll('quantity');
         const items = productIds.map((productId, index) => ({ productId, quantity: Number(quantities[index]) }));
         const transaction = store.createTransaction(tenant.id, user.id, {
-          customerEmail: body.get('customerEmail'),
+          customerEmail: body.fields.get('customerEmail'),
           items
         });
         session.lastEmailResult = await mailer({ transaction, tenant });
@@ -243,10 +258,66 @@ function requiresTenant(pathname) {
   return ['/dashboard', '/products', '/transactions', '/receipts', '/api'].some((prefix) => pathname.startsWith(prefix));
 }
 
-async function parseForm(req) {
-  let data = '';
-  for await (const chunk of req) data += chunk;
-  return new URLSearchParams(data);
+async function parseBody(req) {
+  const contentType = req.headers['content-type'] || '';
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const buffer = Buffer.concat(chunks);
+
+  if (contentType.startsWith('multipart/form-data')) {
+    return parseMultipartBody(buffer, contentType);
+  }
+
+  return { fields: new URLSearchParams(buffer.toString()), files: new Map() };
+}
+
+function parseMultipartBody(buffer, contentType) {
+  const boundaryMatch = contentType.match(/boundary=(?:(?:"([^"]+)")|([^;]+))/);
+  if (!boundaryMatch) throw new Error('Missing multipart boundary.');
+  const boundary = `--${boundaryMatch[1] || boundaryMatch[2]}`;
+  const fields = new URLSearchParams();
+  const files = new Map();
+
+  for (const rawPart of buffer.toString('binary').split(boundary)) {
+    if (!rawPart || rawPart === '--\r\n' || rawPart === '--') continue;
+    const part = rawPart.replace(/^\r\n/, '').replace(/\r\n--$/, '');
+    const separatorIndex = part.indexOf('\r\n\r\n');
+    if (separatorIndex === -1) continue;
+    const rawHeaders = part.slice(0, separatorIndex);
+    const rawValue = part.slice(separatorIndex + 4).replace(/\r\n$/, '');
+    const disposition = rawHeaders.match(/content-disposition: form-data;([^\r\n]+)/i);
+    if (!disposition) continue;
+    const name = matchHeaderParam(disposition[1], 'name');
+    const filename = matchHeaderParam(disposition[1], 'filename');
+    if (!name) continue;
+
+    if (filename) {
+      const mimeType = rawHeaders.match(/content-type: ([^\r\n]+)/i)?.[1]?.trim() || 'application/octet-stream';
+      files.set(name, { filename, mimeType, buffer: Buffer.from(rawValue, 'binary') });
+    } else {
+      fields.append(name, Buffer.from(rawValue, 'binary').toString());
+    }
+  }
+
+  return { fields, files };
+}
+
+function matchHeaderParam(value, paramName) {
+  return value.match(new RegExp(`${paramName}=\"([^\"]*)\"`, 'i'))?.[1];
+}
+
+async function uploadImageFromBody(body, imageUploader) {
+  const file = body.files.get('image');
+  if (!file || file.buffer.length === 0 || !file.filename) return '';
+  return imageUploader(file);
+}
+
+function imageContentType(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === '.png') return 'image/png';
+  if (extension === '.webp') return 'image/webp';
+  if (extension === '.gif') return 'image/gif';
+  return 'image/jpeg';
 }
 
 function tenantHeader(tenant, user) {
@@ -255,13 +326,15 @@ function tenantHeader(tenant, user) {
 
 function productManagementTable(products) {
   if (products.length === 0) return '<p>No products yet.</p>';
-  return `<div class="table-scroll"><table><thead><tr><th>Name</th><th>Description</th><th>Price</th><th>Actions</th></tr></thead><tbody>${products.map((product) => `
+  return `<div class="table-scroll"><table><thead><tr><th>Image</th><th>Name / Description / Price</th><th>Actions</th></tr></thead><tbody>${products.map((product) => `
     <tr>
-      <td colspan="4">
-        <form class="product-edit" method="post" action="/products/${escapeHtml(product.id)}/update">
+      <td>${product.imageUrl ? `<img class="product-thumb" src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.name)}">` : '<span class="muted">No image</span>'}</td>
+      <td colspan="2">
+        <form class="product-edit" method="post" action="/products/${escapeHtml(product.id)}/update" enctype="multipart/form-data">
           <input required name="name" value="${escapeHtml(product.name)}" aria-label="Product name">
           <input name="description" value="${escapeHtml(product.description)}" aria-label="Description">
           <input required name="price" type="number" min="0.01" step="0.01" value="${product.price}" aria-label="Price">
+          <input name="image" type="file" accept="image/png,image/jpeg,image/webp,image/gif" aria-label="Replace product image">
           <button type="submit">Update</button>
         </form>
         <form class="inline-form" method="post" action="/products/${escapeHtml(product.id)}/delete">

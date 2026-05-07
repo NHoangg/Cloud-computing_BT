@@ -31,10 +31,10 @@ const DEFAULT_DATA = {
     }
   ],
   products: [
-    { id: 'prod-espresso', tenantId: 'tenant-coffee', name: 'Espresso', price: 2.5, description: 'Single shot coffee' },
-    { id: 'prod-latte', tenantId: 'tenant-coffee', name: 'Latte', price: 4.25, description: 'Milk coffee' },
-    { id: 'prod-notebook', tenantId: 'tenant-bookstore', name: 'Notebook', price: 3.75, description: 'A5 ruled notebook' },
-    { id: 'prod-pen', tenantId: 'tenant-bookstore', name: 'Gel Pen', price: 1.25, description: 'Blue ink pen' }
+    { id: 'prod-espresso', tenantId: 'tenant-coffee', name: 'Espresso', price: 2.5, description: 'Single shot coffee', imageUrl: '' },
+    { id: 'prod-latte', tenantId: 'tenant-coffee', name: 'Latte', price: 4.25, description: 'Milk coffee', imageUrl: '' },
+    { id: 'prod-notebook', tenantId: 'tenant-bookstore', name: 'Notebook', price: 3.75, description: 'A5 ruled notebook', imageUrl: '' },
+    { id: 'prod-pen', tenantId: 'tenant-bookstore', name: 'Gel Pen', price: 1.25, description: 'Blue ink pen', imageUrl: '' }
   ],
   transactions: []
 };
@@ -64,6 +64,12 @@ class JsonStore {
     for (const user of this.data.users) {
       if (!user.password) {
         user.password = 'password123';
+        changed = true;
+      }
+    }
+    for (const product of this.data.products) {
+      if (typeof product.imageUrl !== 'string') {
+        product.imageUrl = '';
         changed = true;
       }
     }
@@ -154,7 +160,8 @@ class JsonStore {
       tenantId,
       name: productInput.name.trim(),
       price: Number(productInput.price),
-      description: (productInput.description || '').trim()
+      description: (productInput.description || '').trim(),
+      imageUrl: (productInput.imageUrl || '').trim()
     };
     this.data.products.push(product);
     this.persist();
@@ -170,6 +177,9 @@ class JsonStore {
     product.name = productInput.name.trim();
     product.price = Number(productInput.price);
     product.description = (productInput.description || '').trim();
+    if (typeof productInput.imageUrl === 'string') {
+      product.imageUrl = productInput.imageUrl.trim();
+    }
     this.persist();
     return product;
   }

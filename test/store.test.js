@@ -56,11 +56,16 @@ test('product CRUD and transactions are isolated by tenant ID', () => {
 test('web flow logs in, manages products, creates a tenant-scoped receipt, and calls mailer', async () => {
   const store = makeStore();
   const sent = [];
+  const uploadedImages = [];
   const server = http.createServer(createApp({
     store,
     mailer: async (payload) => {
       sent.push(payload);
       return { sent: true, provider: 'test' };
+    },
+    imageUploader: async (file) => {
+      uploadedImages.push(file);
+      return `https://cdn.example.test/${file.filename}`;
     }
   }));
   await listen(server);
@@ -76,14 +81,20 @@ test('web flow logs in, manages products, creates a tenant-scoped receipt, and c
     assert.equal(loginResponse.status, 302);
     const cookie = loginResponse.headers.get('set-cookie').split(';')[0];
 
+    const productMultipart = multipartBody({
+      fields: { name: 'Cappuccino', price: '4.50', description: 'Foam coffee' },
+      file: { fieldName: 'image', filename: 'cappuccino.png', mimeType: 'image/png', content: Buffer.from('fake-png') }
+    });
     await fetch(`${baseUrl}/products`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: cookie },
-      body: new URLSearchParams({ name: 'Cappuccino', price: '4.50', description: 'Foam coffee' }),
+      headers: { 'Content-Type': productMultipart.contentType, Cookie: cookie },
+      body: productMultipart.body,
       redirect: 'manual'
     });
     const createdProduct = store.listProducts('tenant-coffee').find((product) => product.name === 'Cappuccino');
     assert.ok(createdProduct);
+    assert.equal(createdProduct.imageUrl, 'https://cdn.example.test/cappuccino.png');
+    assert.equal(uploadedImages.length, 1);
 
     await fetch(`${baseUrl}/products/${createdProduct.id}/update`, {
       method: 'POST',
@@ -136,4 +147,19 @@ function listen(server) {
 
 function close(server) {
   return new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+}
+
+function multipartBody({ fields, file }) {
+  const boundary = `----pos-test-${Date.now()}`;
+  const chunks = [];
+  for (const [name, value] of Object.entries(fields)) {
+    chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`));
+  }
+  chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${file.fieldName}"; filename="${file.filename}"\r\nContent-Type: ${file.mimeType}\r\n\r\n`));
+  chunks.push(file.content);
+  chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  return {
+    body: Buffer.concat(chunks),
+    contentType: `multipart/form-data; boundary=${boundary}`
+  };
 }
