@@ -1,0 +1,14 @@
+{
+  "name": "saas-pos-cloud-assessment",
+  "version": "1.0.0",
+  "description": "Multi-tenant SaaS web-based Point-of-Sale application for cloud computing assessment.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "NODE_ENV=development node src/server.js",
+    "test": "node --test"
+  },
+  "keywords": ["saas", "pos", "multi-tenant", "cloud-computing"],
+  "author": "",
+  "license": "MIT"
+}
